@@ -539,6 +539,7 @@ async def rip(
                           Body=thumb, ContentType="image/jpeg",
                           CacheControl="public, max-age=31536000")
 
+        import time as _t
         entry = {
             "raw_id": rid, "id": rid,
             "title": title, "display_title": title, "artist": artist,
@@ -547,7 +548,7 @@ async def rip(
             "key": meta.get("key", ""), "music_key": meta.get("key", ""),
             "camelot": "", "energy": None,
             "duration": dur, "dur": dur, "duration_ms": dur_ms,
-            "source": src, "source_id": str(id),
+            "source": src, "source_id": str(id), "added": int(_t.time()),
         }
 
         # read-modify-write the library the phone reads
@@ -566,7 +567,7 @@ async def rip(
         tracks = [t for t in tracks if str(t.get("raw_id")) != rid
                   and not (t.get("source_id") and str(t.get("source_id")) == str(id)
                            and t.get("source") == src)]
-        tracks.insert(0, entry)
+        tracks.append(entry)   # newest at the end — matches the app's recent order
         lib["tracks"] = tracks
         import json as _j
         s3.put_object(Bucket=bucket, Key=f"u/{space}/library.json",

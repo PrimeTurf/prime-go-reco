@@ -643,6 +643,7 @@ async def queue(
     title: str = Query(""),
     artist: str = Query(""),
     thumb: str = Query(""),
+    dur: str = Query(""),
 ):
     src = "soundcloud" if src == "soundcloud" else "youtube"
     space = _SAFE.sub("", str(space))
@@ -671,10 +672,14 @@ async def queue(
     # already queued? then it's a no-op success
     if any(str(it.get("id")) == str(id) and it.get("src") == src for it in q):
         return {"ok": True, "queued": len(q), "already": True}
+    try:
+        _dur = int(float(dur)) if dur else None
+    except Exception:
+        _dur = None
     q.append({
         "src": src, "id": str(id),
         "title": title or "Untitled", "artist": artist or "",
-        "thumb": thumb or "", "added": int(_t.time()),
+        "thumb": thumb or "", "dur": _dur, "added": int(_t.time()),
         "status": "waiting",
     })
     data["queue"] = q

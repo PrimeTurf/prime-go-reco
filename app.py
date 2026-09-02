@@ -410,6 +410,10 @@ def _rid(src: str, vid: str) -> str:
 def _split_meta(info: dict):
     title = (info.get("track") or "").strip()
     artist = (info.get("artist") or info.get("creator") or "").strip()
+    if not artist:
+        arr = info.get("artists")
+        if isinstance(arr, list) and arr:
+            artist = ", ".join(str(a).strip() for a in arr if a).strip()
     raw = (info.get("title") or "").strip()
     if not title:
         if not artist and " - " in raw:
@@ -420,6 +424,51 @@ def _split_meta(info: dict):
     if not artist:
         artist = (info.get("uploader") or info.get("channel") or "").strip()
     return (title or "Untitled"), artist
+
+
+def _artist_by_length(title: str, dur_sec, tol_sec: float = 6.0) -> str:
+    """Find the real artist for a title-only track by matching the SONG LENGTH.
+    When SoundCloud hands back a bare title and no artist, the duration is the
+    fingerprint: the recording of that name whose length matches is almost
+    always the right track, and it carries the artist credit. Uses MusicBrainz
+    (free, no key). Best effort — never raises, returns "" on any miss."""
+    t = (title or "").strip()
+    if not t or not dur_sec:
+        return ""
+    try:
+        dur_ms = int(float(dur_sec) * 1000)
+    except Exception:
+        return ""
+    try:
+        q = re.sub(r'["\\]', " ", t).strip()
+        r = httpx.get(
+            "https://musicbrainz.org/ws/2/recording/",
+            params={"query": f'recording:"{q}"', "fmt": "json", "limit": 25},
+            headers={"User-Agent": "PrimeGoReco/1.0 (https://prime-go-reco.onrender.com)"},
+            timeout=20, follow_redirects=True,
+        )
+        if r.status_code != 200:
+            return ""
+        recs = (r.json() or {}).get("recordings") or []
+    except Exception:
+        return ""
+    tol_ms = max(3000, int(tol_sec * 1000))
+    best, best_gap = "", tol_ms + 1
+    for rec in recs:
+        length = rec.get("length")
+        if not length:
+            continue
+        try:
+            gap = abs(int(length) - dur_ms)
+        except Exception:
+            continue
+        if gap <= tol_ms and gap < best_gap:
+            ac = rec.get("artist-credit") or []
+            name = "".join((c.get("name") or "") + (c.get("joinphrase") or "")
+                           for c in ac).strip()
+            if name:
+                best, best_gap = name, gap
+    return best
 
 
 def _rip_sync(src: str, vid: str):
@@ -568,6 +617,13 @@ async def rip(
         title, artist = _split_meta(info)
         dur = info.get("duration")
         dur_ms = int(float(dur) * 1000) if dur else None
+        # No artist off the upload? Find it by the song's LENGTH. A SoundCloud
+        # track with just a title still has a real artist somewhere — the
+        # recording of that name whose duration matches is the one.
+        if (not artist or artist.lower() in ("", "unknown", "unknown artist", "various", "va")):
+            found = await asyncio.to_thread(_artist_by_length, title, dur)
+            if found:
+                artist = found
         rid = _rid(src, id)
 
         meta = await asyncio.to_thread(_analyze, mp3_path)

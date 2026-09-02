@@ -829,6 +829,58 @@ async def share_add(
     return {"ok": True, "added": added}
 
 
+@app.post("/remove")
+async def remove(
+    space: str = Query(...),     # the caller's own space
+    ids: str = Query(...),       # comma-separated raw_ids to delete
+):
+    """Delete tracks from a space: drop them out of library.json and remove the
+    audio + cover objects from R2. This is the phone's Delete from library."""
+    space = _SAFE.sub("", str(space))
+    if not space:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "bad space"})
+    s3 = _r2()
+    if s3 is None:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "cloud not set up"})
+    bucket = os.getenv("R2_BUCKET", "").strip()
+    if not bucket:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "R2_BUCKET not set"})
+    import json as _j
+    want = {x.strip() for x in str(ids).split(",") if x.strip()}
+    if not want:
+        return {"ok": True, "removed": 0}
+    key = f"u/{space}/library.json"
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        cur = _j.loads(obj["Body"].read().decode("utf-8"))
+    except Exception as e:
+        return JSONResponse(status_code=200, content={"ok": False, "error": f"no library: {str(e)[:120]}"})
+    tracks = cur.get("tracks") if isinstance(cur, dict) else cur
+    tracks = tracks if isinstance(tracks, list) else []
+    keep = [t for t in tracks if str(t.get("raw_id")) not in want]
+    removed = len(tracks) - len(keep)
+    # delete the audio + cover for each removed id (best effort)
+    for rid in want:
+        for k in (f"u/{space}/audio/{rid}.mp3", f"u/{space}/cover/{rid}.jpg"):
+            try:
+                s3.delete_object(Bucket=bucket, Key=k)
+            except Exception:
+                pass
+    if removed:
+        if isinstance(cur, dict):
+            cur["tracks"] = keep
+        else:
+            cur = {"tracks": keep}
+        try:
+            s3.put_object(Bucket=bucket, Key=key,
+                          Body=_j.dumps(cur).encode("utf-8"),
+                          ContentType="application/json",
+                          CacheControl="public, max-age=15")
+        except Exception as e:
+            return JSONResponse(status_code=200, content={"ok": False, "error": str(e)[:160]})
+    return {"ok": True, "removed": removed}
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "8000"))

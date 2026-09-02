@@ -881,6 +881,50 @@ async def remove(
     return {"ok": True, "removed": removed}
 
 
+@app.post("/playlist_push")
+async def playlist_push(
+    space: str = Query(...),     # the caller's own space
+    name: str = Query(...),      # playlist name
+    ids: str = Query(...),       # comma-separated raw_ids in the playlist
+):
+    """A playlist built in Prime Go is sent to the desktop: queued in
+    u/<space>/inbox_playlists.json for the desktop to pick up and send to USB."""
+    space = _SAFE.sub("", str(space))
+    name = (name or "").strip()[:120]
+    if not space or not name:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "bad request"})
+    want = [x.strip() for x in str(ids).split(",") if x.strip()][:1000]
+    if not want:
+        return {"ok": True, "queued": 0}
+    s3 = _r2()
+    if s3 is None:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "cloud not set up"})
+    bucket = os.getenv("R2_BUCKET", "").strip()
+    if not bucket:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "R2_BUCKET not set"})
+    import json as _j, time as _t
+    key = f"u/{space}/inbox_playlists.json"
+    cur = []
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        got = _j.loads(obj["Body"].read().decode("utf-8"))
+        cur = got.get("playlists", []) if isinstance(got, dict) else (got or [])
+    except Exception:
+        cur = []
+    pid = name.lower().replace(" ", "_")
+    cur = [p for p in cur if p.get("id") != pid]
+    cur.append({"id": pid, "name": name, "ids": want, "count": len(want),
+                "ts": int(_t.time() * 1000)})
+    cur = cur[-100:]
+    try:
+        s3.put_object(Bucket=bucket, Key=key,
+                      Body=_j.dumps({"playlists": cur}).encode("utf-8"),
+                      ContentType="application/json", CacheControl="no-cache")
+    except Exception as e:
+        return JSONResponse(status_code=200, content={"ok": False, "error": str(e)[:160]})
+    return {"ok": True, "queued": len(want)}
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "8000"))

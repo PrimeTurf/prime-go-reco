@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: prime-go-reco
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 8000

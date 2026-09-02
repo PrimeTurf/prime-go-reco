@@ -583,6 +583,67 @@ async def rip(
             shutil.rmtree(workdir, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# 6. POST /queue  -- hand a YouTube track to the desktop to rip.
+#    YouTube blocks downloading from this server's IP, but the user's desktop
+#    runs on a home IP that YouTube does not block. So instead of ripping here,
+#    we drop the track into u/<space>/rip_queue.json. Prime Rip on the desktop
+#    watches that file, rips each track cleanly (with BPM + key), uploads it to
+#    the same R2 space, and removes it from the queue.
+# ---------------------------------------------------------------------------
+@app.post("/queue")
+async def queue(
+    src: str = Query("youtube"),
+    id: str = Query(...),
+    space: str = Query(...),
+    title: str = Query(""),
+    artist: str = Query(""),
+    thumb: str = Query(""),
+):
+    src = "soundcloud" if src == "soundcloud" else "youtube"
+    space = _SAFE.sub("", str(space))
+    if not space:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "no space"})
+    s3 = _r2()
+    if s3 is None:
+        return JSONResponse(status_code=503, content={
+            "ok": False, "error": "The rip list is not set up yet (missing R2 keys)."})
+    bucket = os.getenv("R2_BUCKET", "").strip()
+    if not bucket:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "R2_BUCKET not set"})
+    key = f"u/{space}/rip_queue.json"
+    import json as _j, time as _t
+    data = {"queue": []}
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        cur = _j.loads(obj["Body"].read().decode("utf-8"))
+        if isinstance(cur, dict) and isinstance(cur.get("queue"), list):
+            data = cur
+        elif isinstance(cur, list):
+            data = {"queue": cur}
+    except Exception:
+        pass
+    q = data.get("queue", [])
+    # already queued? then it's a no-op success
+    if any(str(it.get("id")) == str(id) and it.get("src") == src for it in q):
+        return {"ok": True, "queued": len(q), "already": True}
+    q.append({
+        "src": src, "id": str(id),
+        "title": title or "Untitled", "artist": artist or "",
+        "thumb": thumb or "", "added": int(_t.time()),
+        "status": "waiting",
+    })
+    data["queue"] = q
+    try:
+        s3.put_object(Bucket=bucket, Key=key,
+                      Body=_j.dumps(data).encode("utf-8"),
+                      ContentType="application/json",
+                      CacheControl="public, max-age=15")
+    except Exception as e:
+        return JSONResponse(status_code=200, content={"ok": False, "error": str(e)[:160]})
+    return {"ok": True, "queued": len(q)}
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "8000"))

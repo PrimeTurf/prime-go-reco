@@ -32,6 +32,13 @@ import yt_dlp
 
 app = FastAPI(title="Prime Go reco-service")
 
+# YouTube blocks the default "web" client from datacenter IPs ("Sign in to
+# confirm you're not a bot"). These alternate player clients often resolve
+# without cookies; yt-dlp tries them in order. Overridable via env.
+_YT_CLIENTS = [c.strip() for c in os.getenv(
+    "YT_PLAYER_CLIENTS", "tv,mweb,web_safari,android,ios").split(",") if c.strip()]
+_YT_EXTRACTOR_ARGS = {"youtube": {"player_client": _YT_CLIENTS}}
+
 # ---------------------------------------------------------------------------
 # CORS: fully open. The phone lives on a Cloudflare R2 origin and calls us
 # cross-origin, so we allow every origin and the methods/headers we use.
@@ -181,8 +188,14 @@ def _search_sync(query: str, src: str, limit: int):
                 thumbs = entry.get("thumbnails") or []
                 if thumbs:
                     thumb = thumbs[-1].get("url")
+            # SoundCloud must be resolved by its permalink URL, not its numeric
+            # id; YouTube resolves fine by the 11-char video id.
+            if src == "soundcloud":
+                the_id = entry.get("url") or entry.get("permalink_url") or entry.get("id")
+            else:
+                the_id = entry.get("id") or entry.get("url")
             results.append({
-                "id": entry.get("id") or entry.get("url"),
+                "id": the_id,
                 "title": entry.get("title"),
                 "artist": entry.get("uploader")
                 or entry.get("channel")
@@ -226,6 +239,7 @@ def _resolve_audio_sync(src: str, vid: str):
         "skip_download": True,
         # Prefer m4a, then mp3, then any bestaudio.
         "format": "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best",
+        "extractor_args": _YT_EXTRACTOR_ARGS,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(target, download=False)
@@ -396,6 +410,7 @@ def _rip_sync(src: str, vid: str):
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
         "noplaylist": True,
+        "extractor_args": _YT_EXTRACTOR_ARGS,
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",

@@ -329,6 +329,245 @@ async def stream(
     )
 
 
+# ---------------------------------------------------------------------------
+# 5. POST /rip  -- download a chosen track and DROP IT into the user's cloud
+#    library, so it plays offline everywhere and syncs like a desktop rip.
+#    Fully standalone: no laptop needed. Writes straight to Cloudflare R2.
+# ---------------------------------------------------------------------------
+#
+# R2 write access comes from env vars set on the service (never in the phone):
+#   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET, R2_PUBLIC_URL
+# Optional: PG_ANALYZE=0 turns off BPM/key detection without a redeploy.
+
+def _r2():
+    """boto3 S3 client pointed at this account's R2, from env. None if unset."""
+    acct = os.getenv("R2_ACCOUNT_ID", "").strip()
+    key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
+    sec = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
+    if not (acct and key and sec):
+        return None
+    import boto3
+    from botocore.config import Config
+    return boto3.client(
+        "s3",
+        endpoint_url=f"https://{acct}.r2.cloudflarestorage.com",
+        aws_access_key_id=key,
+        aws_secret_access_key=sec,
+        config=Config(signature_version="s3v4", retries={"max_attempts": 3}),
+        region_name="auto",
+    )
+
+
+_SAFE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _rid(src: str, vid: str) -> str:
+    """A stable, filesystem/URL-safe raw_id. Same song re-ripped -> same id,
+    so it overwrites cleanly instead of duplicating."""
+    tag = _SAFE.sub("", str(vid))[:40] or "x"
+    return f"{'sc' if src == 'soundcloud' else 'yt'}_{tag}"
+
+
+def _split_meta(info: dict):
+    title = (info.get("track") or "").strip()
+    artist = (info.get("artist") or info.get("creator") or "").strip()
+    raw = (info.get("title") or "").strip()
+    if not title:
+        if not artist and " - " in raw:
+            a, t = raw.split(" - ", 1)
+            artist, title = a.strip(), t.strip()
+        else:
+            title = raw
+    if not artist:
+        artist = (info.get("uploader") or info.get("channel") or "").strip()
+    return (title or "Untitled"), artist
+
+
+def _rip_sync(src: str, vid: str):
+    """Download bestaudio -> mp3, return (mp3_path, info, thumb_bytes)."""
+    if src == "soundcloud":
+        target = vid if str(vid).startswith("http") else f"https://soundcloud.com/{vid}"
+    else:
+        target = vid if str(vid).startswith("http") else f"https://www.youtube.com/watch?v={vid}"
+    workdir = tempfile.mkdtemp(prefix="pgrip_")
+    outtmpl = os.path.join(workdir, "a.%(ext)s")
+    ydl_opts = {
+        "quiet": True, "no_warnings": True,
+        "format": "bestaudio/best",
+        "outtmpl": outtmpl,
+        "noplaylist": True,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "0",
+        }],
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(target, download=True)
+    if info and "entries" in info:
+        ents = [e for e in (info.get("entries") or []) if e]
+        if ents:
+            info = ents[0]
+    mp3 = os.path.join(workdir, "a.mp3")
+    if not os.path.exists(mp3):
+        cand = [f for f in os.listdir(workdir) if f.endswith(".mp3")]
+        if cand:
+            mp3 = os.path.join(workdir, cand[0])
+    if not os.path.exists(mp3):
+        raise RuntimeError("audio did not download")
+    # thumbnail bytes -> jpg (best effort)
+    thumb_jpg = None
+    thumb = info.get("thumbnail")
+    if not thumb:
+        ths = info.get("thumbnails") or []
+        if ths:
+            thumb = ths[-1].get("url")
+    if thumb:
+        try:
+            raw = httpx.get(thumb, timeout=20, follow_redirects=True).content
+            src_img = os.path.join(workdir, "cover.src")
+            with open(src_img, "wb") as f:
+                f.write(raw)
+            out_jpg = os.path.join(workdir, "cover.jpg")
+            p = subprocess.run(
+                ["ffmpeg", "-y", "-i", src_img, "-vf",
+                 "scale='min(640,iw)':-1", out_jpg],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            if p.returncode == 0 and os.path.exists(out_jpg):
+                with open(out_jpg, "rb") as f:
+                    thumb_jpg = f.read()
+        except Exception:
+            thumb_jpg = None
+    return mp3, info, thumb_jpg
+
+
+def _analyze(mp3_path: str):
+    """Best-effort BPM + musical key from a 60s excerpt. Never raises."""
+    if os.getenv("PG_ANALYZE", "1") == "0":
+        return {}
+    try:
+        import numpy as np
+        import librosa
+        y, sr = librosa.load(mp3_path, sr=22050, mono=True, offset=30.0, duration=60.0)
+        if y is None or len(y) < sr:
+            y, sr = librosa.load(mp3_path, sr=22050, mono=True, duration=60.0)
+        out = {}
+        try:
+            tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+            bpm = int(round(float(np.atleast_1d(tempo)[0])))
+            if 40 <= bpm <= 220:
+                out["bpm"] = bpm
+        except Exception:
+            pass
+        try:
+            chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+            prof = chroma.mean(axis=1)
+            names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+            # Krumhansl-Schmuckler major/minor templates
+            maj = np.array([6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88])
+            minor = np.array([6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17])
+            best, bkey = -9, ""
+            for i in range(12):
+                for tmpl, mode in ((maj, ""), (minor, "m")):
+                    r = float(np.corrcoef(prof, np.roll(tmpl, i))[0, 1])
+                    if r > best:
+                        best, bkey = r, names[i] + mode
+            if bkey:
+                out["key"] = bkey
+        except Exception:
+            pass
+        return out
+    except Exception:
+        return {}
+
+
+@app.post("/rip")
+async def rip(
+    src: str = Query("youtube"),
+    id: str = Query(...),
+    space: str = Query(...),
+):
+    """Rip one track into u/<space>/ and append it to that space's library.json."""
+    src = "soundcloud" if src == "soundcloud" else "youtube"
+    space = _SAFE.sub("", str(space))
+    if not space:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "no space"})
+    s3 = _r2()
+    if s3 is None:
+        return JSONResponse(status_code=503, content={
+            "ok": False,
+            "error": "Cloud ripping is not set up yet (the service is missing its R2 keys)."})
+    bucket = os.getenv("R2_BUCKET", "").strip()
+    pub = os.getenv("R2_PUBLIC_URL", "").strip().rstrip("/")
+    if not bucket:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "R2_BUCKET not set"})
+
+    workdir = None
+    try:
+        mp3_path, info, thumb = await asyncio.to_thread(_rip_sync, src, id)
+        workdir = os.path.dirname(mp3_path)
+        title, artist = _split_meta(info)
+        dur = info.get("duration")
+        dur_ms = int(float(dur) * 1000) if dur else None
+        rid = _rid(src, id)
+
+        meta = await asyncio.to_thread(_analyze, mp3_path)
+
+        with open(mp3_path, "rb") as f:
+            audio_bytes = f.read()
+        s3.put_object(Bucket=bucket, Key=f"u/{space}/audio/{rid}.mp3",
+                      Body=audio_bytes, ContentType="audio/mpeg",
+                      CacheControl="public, max-age=31536000")
+        if thumb:
+            s3.put_object(Bucket=bucket, Key=f"u/{space}/cover/{rid}.jpg",
+                          Body=thumb, ContentType="image/jpeg",
+                          CacheControl="public, max-age=31536000")
+
+        entry = {
+            "raw_id": rid, "id": rid,
+            "title": title, "display_title": title, "artist": artist,
+            "album": "", "genre": "",
+            "bpm": meta.get("bpm"),
+            "key": meta.get("key", ""), "music_key": meta.get("key", ""),
+            "camelot": "", "energy": None,
+            "duration": dur, "dur": dur, "duration_ms": dur_ms,
+            "source": src, "source_id": str(id),
+        }
+
+        # read-modify-write the library the phone reads
+        lib = {"tracks": []}
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=f"u/{space}/library.json")
+            import json as _j
+            cur = _j.loads(obj["Body"].read().decode("utf-8"))
+            if isinstance(cur, dict) and isinstance(cur.get("tracks"), list):
+                lib = cur
+            elif isinstance(cur, list):
+                lib = {"tracks": cur}
+        except Exception:
+            pass
+        tracks = lib.get("tracks", [])
+        tracks = [t for t in tracks if str(t.get("raw_id")) != rid
+                  and not (t.get("source_id") and str(t.get("source_id")) == str(id)
+                           and t.get("source") == src)]
+        tracks.insert(0, entry)
+        lib["tracks"] = tracks
+        import json as _j
+        s3.put_object(Bucket=bucket, Key=f"u/{space}/library.json",
+                      Body=_j.dumps(lib).encode("utf-8"),
+                      ContentType="application/json",
+                      CacheControl="public, max-age=60")
+
+        return {"ok": True, "track": entry,
+                "audio": f"{pub}/u/{space}/audio/{rid}.mp3" if pub else ""}
+    except Exception as e:
+        return JSONResponse(status_code=200, content={"ok": False, "error": str(e)[:200]})
+    finally:
+        if workdir and os.path.isdir(workdir):
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "8000"))

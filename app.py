@@ -749,6 +749,86 @@ async def queue(
     return {"ok": True, "queued": len(q)}
 
 
+# ---------------------------------------------------------------------------
+# SHARE: copy one or more tracks from one person's cloud space into another's,
+# so a shared song or playlist becomes truly theirs — the audio and artwork are
+# copied server-side (R2 to R2, no download), and the tracks are appended to the
+# recipient's library the phone reads.
+# ---------------------------------------------------------------------------
+@app.post("/share_add")
+async def share_add(
+    frm: str = Query(...),      # source space (who shared)
+    to: str = Query(...),       # recipient space (who is adding)
+    ids: str = Query(...),      # comma-separated raw_ids to copy
+):
+    frm = _SAFE.sub("", str(frm)); to = _SAFE.sub("", str(to))
+    if not frm or not to:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "bad space"})
+    if frm == to:
+        return {"ok": True, "added": 0, "already": True}   # your own track
+    s3 = _r2()
+    if s3 is None:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "cloud not set up"})
+    bucket = os.getenv("R2_BUCKET", "").strip()
+    if not bucket:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "R2_BUCKET not set"})
+    import json as _j
+    want = [x.strip() for x in str(ids).split(",") if x.strip()][:200]
+    if not want:
+        return {"ok": True, "added": 0}
+
+    def _load_lib(space):
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=f"u/{space}/library.json")
+            cur = _j.loads(obj["Body"].read().decode("utf-8"))
+            t = cur.get("tracks") if isinstance(cur, dict) else cur
+            return cur if isinstance(cur, dict) else {"tracks": t or []}, (t or [])
+        except Exception:
+            return {"tracks": []}, []
+
+    src_lib, src_tracks = _load_lib(frm)
+    by_id = {str(t.get("raw_id")): t for t in src_tracks}
+    dst_lib, dst_tracks = _load_lib(to)
+    have = {str(t.get("raw_id")) for t in dst_tracks}
+
+    added = 0
+    import time as _t
+    for rid in want:
+        if rid in have:
+            continue
+        meta = by_id.get(rid)
+        if not meta:
+            continue
+        # copy the audio + cover R2->R2 (server side, fast). Cover is best effort.
+        try:
+            s3.copy_object(Bucket=bucket, Key=f"u/{to}/audio/{rid}.mp3",
+                           CopySource={"Bucket": bucket, "Key": f"u/{frm}/audio/{rid}.mp3"})
+        except Exception as e:
+            continue   # no audio to copy = nothing to add
+        try:
+            s3.copy_object(Bucket=bucket, Key=f"u/{to}/cover/{rid}.jpg",
+                           CopySource={"Bucket": bucket, "Key": f"u/{frm}/cover/{rid}.jpg"})
+        except Exception:
+            pass
+        entry = dict(meta)
+        entry["added"] = int(_t.time())
+        entry["shared_from"] = frm
+        dst_tracks.append(entry)
+        have.add(rid)
+        added += 1
+
+    if added:
+        dst_lib["tracks"] = dst_tracks
+        try:
+            s3.put_object(Bucket=bucket, Key=f"u/{to}/library.json",
+                          Body=_j.dumps(dst_lib).encode("utf-8"),
+                          ContentType="application/json",
+                          CacheControl="public, max-age=15")
+        except Exception as e:
+            return JSONResponse(status_code=200, content={"ok": False, "error": str(e)[:160]})
+    return {"ok": True, "added": added}
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "8000"))

@@ -455,6 +455,24 @@ def _rip_sync(src: str, vid: str):
             mp3 = os.path.join(workdir, cand[0])
     if not os.path.exists(mp3):
         raise RuntimeError("audio did not download")
+    # PEAK CAP: hot masters keep their full level (we do NOT loudness-normalize
+    # rips, that would gut club weight), but a master sitting at or above full
+    # scale clips on a phone speaker — the "speaker about to burst" distortion.
+    # A true-peak brickwall limiter at -1.5 dBFS with no makeup gain shaves only
+    # the overs and leaves loudness untouched. Best effort: if it fails we keep
+    # the original file rather than lose the rip.
+    try:
+        capped = os.path.join(workdir, "a.cap.mp3")
+        pc = subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-nostdin", "-i", mp3,
+             "-af", "alimiter=limit=0.841:level=false",
+             "-codec:a", "libmp3lame", "-q:a", "0", capped],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120,
+        )
+        if pc.returncode == 0 and os.path.exists(capped) and os.path.getsize(capped) > 0:
+            os.replace(capped, mp3)
+    except Exception:
+        pass
     # thumbnail bytes -> jpg (best effort)
     thumb_jpg = None
     thumb = info.get("thumbnail")

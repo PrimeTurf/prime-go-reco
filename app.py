@@ -202,9 +202,34 @@ def _search_sync(query: str, src: str, limit: int):
                 or entry.get("uploader_id"),
                 "duration": entry.get("duration"),
                 "thumb": thumb,
+                "views": entry.get("view_count"),
                 "src": src,
             })
+    # Prefer the most-played clean audio over the official music video. A DJ
+    # wants the full track, not a video edit with intro talking.
+    if src == "youtube":
+        results.sort(key=_yt_rank, reverse=True)
     return results
+
+
+def _yt_rank(r: dict) -> float:
+    import math
+    title = (r.get("title") or "").lower()
+    artist = (r.get("artist") or "").lower()
+    views = r.get("views") or 0
+    score = 0.0
+    if views:
+        score += math.log10(views + 10) * 10        # most played rises
+    if artist.endswith("- topic") or " - topic" in artist:
+        score += 30                                  # YouTube's clean auto audio
+    for k in ("audio", "lyric", "full", "original mix", "extended mix", "hq"):
+        if k in title:
+            score += 8
+    for k in ("official video", "official music video", "music video",
+              "official mv", " m/v", "live", "remix video", "visualizer"):
+        if k in title:
+            score -= 14
+    return score
 
 
 @app.get("/search")

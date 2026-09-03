@@ -127,25 +127,60 @@ async def reco(request: Request):
         images = track.get("images") or {}
         cover = images.get("coverart") or images.get("coverarthq")
 
-        album = None
-        # Album often lives inside sections[].metadata[] with title "Album".
+        # EVERYTHING SHAZAM ACTUALLY KNOWS, not just the album.
+        # The metadata rows come back as free-form {title, text} pairs and the
+        # set varies by track: Album, Released, Label, Producer and more. We
+        # used to walk them, take "Album", and throw the rest away — so the
+        # release year and the label, which are exactly what tells two versions
+        # of a song apart, were fetched and discarded on every single lookup.
+        meta_all = {}
         try:
             for section in track.get("sections") or []:
                 for meta in section.get("metadata") or []:
-                    if str(meta.get("title", "")).lower() == "album":
-                        album = meta.get("text")
-                        break
-                if album:
-                    break
+                    k = str(meta.get("title", "")).strip()
+                    v = meta.get("text")
+                    if k and v and k not in meta_all:
+                        meta_all[k] = v
         except Exception:
-            album = None
+            meta_all = {}
+
+        def _m(*names):
+            for n in names:
+                for k, v in meta_all.items():
+                    if k.lower() == n:
+                        return v
+            return None
+
+        released = _m("released", "release date", "year")
+        year = None
+        try:
+            import re as _re
+            _y = _re.search(r"(19|20)\d{2}", str(released or ""))
+            year = int(_y.group(0)) if _y else None
+        except Exception:
+            year = None
+
+        genre = None
+        try:
+            genre = ((track.get("genres") or {}).get("primary")) or None
+        except Exception:
+            genre = None
 
         return {
             "matched": True,
             "title": track.get("title", ""),
             "artist": track.get("subtitle", ""),
             "cover": cover,
-            "album": album,
+            "album": _m("album"),
+            "label": _m("label"),
+            "released": released,
+            "year": year,
+            "genre": genre,
+            "isrc": track.get("isrc") or None,
+            "shazam_url": track.get("url") or None,
+            # everything else Shazam sent, so a field we have not named yet is
+            # still there instead of being dropped on the floor
+            "meta": meta_all,
         }
     except Exception as e:  # never crash the process on a bad request
         return {"matched": False, "error": str(e)}
@@ -923,6 +958,89 @@ async def playlist_push(
     except Exception as e:
         return JSONResponse(status_code=200, content={"ok": False, "error": str(e)[:160]})
     return {"ok": True, "queued": len(want)}
+
+
+# ---------------------------------------------------------------------------
+# Shazam history: one list per space, so a night's IDs are not trapped on one
+# phone. localStorage is per browser — open Prime Go from the home screen on
+# Monday and from Safari on Tuesday and you are looking at two different
+# histories, and clearing site data loses the lot. The phone still keeps its
+# local copy and still works with no signal; this is the copy that survives.
+# ---------------------------------------------------------------------------
+_SHZ_KEY = "shazam_history.json"
+_SHZ_MAX = 500
+
+
+def _shz_read(s3, bucket: str, space: str) -> list:
+    import json as _j
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=f"u/{space}/{_SHZ_KEY}")
+        got = _j.loads(obj["Body"].read().decode("utf-8"))
+        items = got.get("found", []) if isinstance(got, dict) else (got or [])
+        return items if isinstance(items, list) else []
+    except Exception:
+        return []
+
+
+@app.post("/shazam_push")
+async def shazam_push(
+    space: str = Query(...),
+    title: str = Query(...),
+    artist: str = Query(""),
+    cover: str = Query(""),
+    ts: int = Query(0),
+    album: str = Query(""),
+    label: str = Query(""),
+    year: str = Query(""),
+    genre: str = Query(""),
+):
+    """Record one identified song against this space. Idempotent: the same
+    title + artist + timestamp never lands twice, so a retry after a dropped
+    connection is free."""
+    space = _SAFE.sub("", str(space))
+    title = (title or "").strip()[:200]
+    if not space or not title:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "bad request"})
+    s3 = _r2()
+    bucket = os.getenv("R2_BUCKET", "").strip()
+    if s3 is None or not bucket:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "cloud not set up"})
+    import json as _j, time as _t
+    when = int(ts) if ts else int(_t.time() * 1000)
+    entry = {"title": title, "artist": (artist or "").strip()[:200],
+             "cover": (cover or "").strip()[:600], "ts": when,
+             "album": (album or "").strip()[:200] or None,
+             "label": (label or "").strip()[:200] or None,
+             "year": int(year) if str(year or "").strip().isdigit() else None,
+             "genre": (genre or "").strip()[:80] or None}
+    cur = _shz_read(s3, bucket, space)
+    sig = (entry["title"], entry["artist"], entry["ts"])
+    if not any((c.get("title"), c.get("artist"), c.get("ts")) == sig for c in cur):
+        cur.append(entry)
+    cur.sort(key=lambda c: c.get("ts") or 0)
+    cur = cur[-_SHZ_MAX:]
+    try:
+        s3.put_object(Bucket=bucket, Key=f"u/{space}/{_SHZ_KEY}",
+                      Body=_j.dumps({"found": cur}).encode("utf-8"),
+                      ContentType="application/json", CacheControl="no-cache")
+    except Exception as e:
+        return JSONResponse(status_code=200, content={"ok": False, "error": str(e)[:160]})
+    return {"ok": True, "count": len(cur)}
+
+
+@app.get("/shazam_list")
+async def shazam_list(space: str = Query(...)):
+    """The whole history for this space, oldest first. The phone normally reads
+    the public JSON directly; this is the fallback when that object is cached or
+    the space has never published one."""
+    space = _SAFE.sub("", str(space))
+    if not space:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "bad request"})
+    s3 = _r2()
+    bucket = os.getenv("R2_BUCKET", "").strip()
+    if s3 is None or not bucket:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "cloud not set up"})
+    return {"ok": True, "found": _shz_read(s3, bucket, space)}
 
 
 if __name__ == "__main__":

@@ -1043,6 +1043,39 @@ async def shazam_list(space: str = Query(...)):
     return {"ok": True, "found": _shz_read(s3, bucket, space)}
 
 
+# ---------------------------------------------------------------------------
+# Sync now: the phone asks the laptop to go, instead of waiting for its timer.
+#
+# The phone cannot reach the laptop. It has no address for it and the laptop is
+# behind a home router. What both of them CAN reach is the bucket, so the phone
+# leaves a note there with the time on it and the laptop, which is already
+# awake, notices and syncs. That is the whole mechanism.
+#
+# Before this, Sync from desktop only re-read the cloud. If the laptop had not
+# run its own sync yet there was nothing new to read, so the button looked
+# broken while doing exactly what it said.
+# ---------------------------------------------------------------------------
+@app.post("/sync_ping")
+async def sync_ping(space: str = Query(...)):
+    """Ask the desktop for this space to sync as soon as it sees this."""
+    space = _SAFE.sub("", str(space))
+    if not space:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "bad request"})
+    s3 = _r2()
+    bucket = os.getenv("R2_BUCKET", "").strip()
+    if s3 is None or not bucket:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "cloud not set up"})
+    import json as _j, time as _t
+    at = int(_t.time() * 1000)
+    try:
+        s3.put_object(Bucket=bucket, Key=f"u/{space}/sync_request.json",
+                      Body=_j.dumps({"at": at}).encode("utf-8"),
+                      ContentType="application/json", CacheControl="no-cache")
+    except Exception as e:
+        return JSONResponse(status_code=200, content={"ok": False, "error": str(e)[:160]})
+    return {"ok": True, "at": at}
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "8000"))

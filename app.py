@@ -285,6 +285,40 @@ async def search(
 # ---------------------------------------------------------------------------
 # 4. GET /stream  -- resolve best audio and proxy it to the phone
 # ---------------------------------------------------------------------------
+def _is_hls(url: str, proto: str = "") -> bool:
+    """Is this a playlist rather than a file?"""
+    u = (url or "").split("?")[0].lower()
+    return "m3u8" in (proto or "").lower() or u.endswith(".m3u8")
+
+
+def _pick_progressive(info):
+    """The best plain http(s) audio file in this result, or None.
+
+    WHY THIS EXISTS — the bug that kept New in Dance silent (2026-09-04).
+    SoundCloud hands yt-dlp an HLS stream by default. The proxy took whatever
+    url came back and streamed it under Content-Type audio/mp4, so what reached
+    the phone was 35 KB beginning "#EXTM3U" — a PLAYLIST OF SEGMENTS, labelled
+    as a song. No audio element can play that. It downloaded fine, it was the
+    right length for a text file, and it failed every single time.
+
+    A progressive format is one file over http, which is what an <audio> tag
+    wants. SoundCloud publishes one alongside the HLS; this finds it."""
+    best = None
+    for fmt in (info.get("formats") or []):
+        u = fmt.get("url")
+        if not u or fmt.get("acodec") == "none":
+            continue
+        if _is_hls(u, fmt.get("protocol") or ""):
+            continue
+        rank = fmt.get("abr") or fmt.get("tbr") or 0
+        if best is None or rank > best[0]:
+            best = (rank, u, (fmt.get("ext") or "").lower(),
+                    fmt.get("http_headers") or info.get("http_headers") or {})
+    if not best:
+        return None
+    return best[1], best[2], best[3]
+
+
 def _resolve_audio_sync(src: str, vid: str):
     """Return (url, http_headers, content_type) for the best audio-only format."""
     if src == "soundcloud":
@@ -304,7 +338,11 @@ def _resolve_audio_sync(src: str, vid: str):
         "no_warnings": True,
         "skip_download": True,
         # Prefer m4a, then mp3, then any bestaudio.
-        "format": "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best",
+        # PROGRESSIVE ONLY. Ask for a plain http(s) file, never HLS. See the
+        # note below _pick_progressive for why this matters more than anything
+        # else in this function.
+        "format": ("bestaudio[protocol^=http][ext=m4a]/bestaudio[protocol^=http][ext=mp3]"
+                   "/bestaudio[protocol^=http]/bestaudio/best"),
         "extractor_args": _YT_EXTRACTOR_ARGS,
         "socket_timeout": 8,
         "retries": 0,
@@ -326,18 +364,19 @@ def _resolve_audio_sync(src: str, vid: str):
     ext = (info.get("ext") or "").lower()
     # yt-dlp exposes per-format request headers needed to fetch the media.
     http_headers = info.get("http_headers") or {}
+    proto = (info.get("protocol") or "").lower()
 
-    if not url:
-        # Fall back to scanning formats for a direct audio url.
-        for fmt in reversed(info.get("formats") or []):
-            if fmt.get("url") and (fmt.get("acodec") not in (None, "none")):
-                url = fmt["url"]
-                ext = (fmt.get("ext") or ext).lower()
-                http_headers = fmt.get("http_headers") or http_headers
-                break
-
-    if not url:
-        raise RuntimeError("could not resolve audio url")
+    if not url or _is_hls(url, proto):
+        picked = _pick_progressive(info)
+        if picked:
+            url, ext, http_headers = picked
+        elif not url:
+            raise RuntimeError("could not resolve audio url")
+        else:
+            # Only HLS on offer. Serving the playlist would hand the phone a
+            # text file named like a song, which is exactly the bug this
+            # guards: better a clear error than silent nonsense.
+            raise RuntimeError("only an HLS stream is available for this track")
 
     if ext in ("m4a", "mp4", "aac"):
         content_type = "audio/mp4"

@@ -293,6 +293,12 @@ def _resolve_audio_sync(src: str, vid: str):
     else:
         target = vid if str(vid).startswith("http") else f"https://www.youtube.com/watch?v={vid}"
 
+    # FAIL FAST. YouTube refuses this server's address — it is a datacenter IP
+    # and every player client comes back "failed to extract any player
+    # response". With no limits set, yt-dlp worked through all five clients
+    # with retries for FORTY SIX SECONDS before giving up, and the phone just
+    # sat there. It is going to fail either way; it should fail quickly enough
+    # for the app to move on to SoundCloud, which works.
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -300,6 +306,11 @@ def _resolve_audio_sync(src: str, vid: str):
         # Prefer m4a, then mp3, then any bestaudio.
         "format": "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best",
         "extractor_args": _YT_EXTRACTOR_ARGS,
+        "socket_timeout": 8,
+        "retries": 0,
+        "extractor_retries": 0,
+        "fragment_retries": 0,
+        "noplaylist": True,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(target, download=False)
@@ -352,7 +363,14 @@ async def stream(
             _resolve_audio_sync, src, id
         )
     except Exception as e:
-        return JSONResponse(status_code=502, content={"error": str(e)})
+        # Say WHICH service refused, so the phone can tell the difference
+        # between "this song is not on SoundCloud" and "YouTube will not talk
+        # to this server", and so the logs are readable at a glance.
+        return JSONResponse(status_code=502,
+                            content={"error": str(e)[:300], "src": src,
+                                     "hint": ("YouTube refuses this server's address; "
+                                              "SoundCloud is the audio path")
+                                     if src == "youtube" else ""})
 
     # Forward the client's Range header (for seeking) plus the headers yt-dlp
     # says are needed to fetch the media from the CDN.

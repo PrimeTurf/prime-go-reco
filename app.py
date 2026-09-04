@@ -471,7 +471,13 @@ async def stream(
             else:
                 end = min(end if end is not None else total - 1, total - 1)
 
-    resp_headers = {"Access-Control-Allow-Origin": "*"}
+    # LET THE WARM UP COUNT. The phone fetches the NEXT song while the current
+    # one plays, so the handover on a locked screen needs no new network load —
+    # iOS does not start those from a page in the background. That only helps
+    # if the bytes it warmed can be reused by the player a minute later, which
+    # needs the browser to be allowed to keep them. Private, half an hour.
+    resp_headers = {"Access-Control-Allow-Origin": "*",
+                    "Cache-Control": "private, max-age=1800"}
     if start is not None:
         status_code = 206
         resp_headers["Accept-Ranges"] = "bytes"

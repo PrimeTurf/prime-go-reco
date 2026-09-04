@@ -394,21 +394,81 @@ async def stream(
         await client.aclose()
         return JSONResponse(status_code=502, content={"error": f"upstream {code}"})
 
-    # Pass through the streaming/range-relevant response headers.
-    resp_headers = {
-        "Access-Control-Allow-Origin": "*",
-        "Accept-Ranges": upstream.headers.get("accept-ranges", "bytes"),
-    }
-    for h in ("content-length", "content-range"):
-        if h in upstream.headers:
-            resp_headers[h] = upstream.headers[h]
+    # ---------------------------------------------------------------------
+    # RANGE, PROPERLY. This is what kept New in Dance silent on the phone.
+    #
+    # A phone does not fetch audio in one go. It asks for a few bytes first, as
+    # "Range: bytes=0-1", and expects 206 with a Content-Range telling it how
+    # big the file is. This proxy used to answer that with 200 and the whole
+    # file while still advertising "Accept-Ranges: bytes" — because SoundCloud's
+    # CDN ignores the Range and the 200 was passed straight through. Claiming
+    # range support and then not honouring it is the one answer a phone will
+    # not accept, so it gave up and the app said it could not play the song.
+    # Songs from the crate were fine: those come from the bucket, which does
+    # ranges properly. Exactly the split John was seeing.
+    #
+    # So: if the source honoured the range, pass it through. If it ignored it,
+    # satisfy the range HERE by skipping to the offset and stopping at the end.
+    # And if the size is unknown, say "Accept-Ranges: none" instead of promising
+    # something we cannot do — an honest no is playable, a false yes is not.
+    # ---------------------------------------------------------------------
+    try:
+        total = int(upstream.headers.get("content-length"))
+    except (TypeError, ValueError):
+        total = None
 
-    status_code = 206 if (client_range and upstream.status_code == 206) else 200
+    start = end = None
+    if client_range and upstream.status_code == 200 and total:
+        m = re.match(r"^\s*bytes=(\d*)-(\d*)\s*$", client_range)
+        if m:
+            s_txt, e_txt = m.group(1), m.group(2)
+            if s_txt == "" and e_txt:                 # the last N bytes
+                start, end = max(0, total - int(e_txt)), total - 1
+            elif s_txt != "":
+                start = int(s_txt)
+                end = int(e_txt) if e_txt else total - 1
+            if start is None or start >= total:
+                start = end = None                    # unsatisfiable: send it all
+            else:
+                end = min(end if end is not None else total - 1, total - 1)
+
+    resp_headers = {"Access-Control-Allow-Origin": "*"}
+    if start is not None:
+        status_code = 206
+        resp_headers["Accept-Ranges"] = "bytes"
+        resp_headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+        resp_headers["Content-Length"] = str(end - start + 1)
+    elif upstream.status_code == 206 and "content-range" in upstream.headers:
+        status_code = 206
+        resp_headers["Accept-Ranges"] = "bytes"
+        resp_headers["Content-Range"] = upstream.headers["content-range"]
+        if "content-length" in upstream.headers:
+            resp_headers["Content-Length"] = upstream.headers["content-length"]
+    else:
+        status_code = 200
+        # only promise ranges when the size is known, so a second request for
+        # bytes 500000- can actually be answered
+        resp_headers["Accept-Ranges"] = "bytes" if total else "none"
+        if total:
+            resp_headers["Content-Length"] = str(total)
 
     async def body_iter():
         try:
-            async for chunk in upstream.aiter_bytes(chunk_size=64 * 1024):
-                yield chunk
+            if start is None:
+                async for chunk in upstream.aiter_bytes(chunk_size=64 * 1024):
+                    yield chunk
+            else:
+                pos, want = 0, end + 1
+                async for chunk in upstream.aiter_bytes(chunk_size=64 * 1024):
+                    nxt = pos + len(chunk)
+                    if nxt > start:                 # some of this chunk is wanted
+                        lo = max(0, start - pos)
+                        hi = min(len(chunk), want - pos)
+                        if hi > lo:
+                            yield chunk[lo:hi]
+                    pos = nxt
+                    if pos >= want:
+                        break
         finally:
             await upstream.aclose()
             await client.aclose()

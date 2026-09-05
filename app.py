@@ -283,6 +283,56 @@ async def search(
 
 
 # ---------------------------------------------------------------------------
+# 3b. GET /list  -- every track in a SoundCloud set, likes page or profile
+# ---------------------------------------------------------------------------
+# Prime Go could rip one SoundCloud song at a time. A whole list — a set, a
+# DJ's likes, an artist page — meant doing that fifty times. Paste the list's
+# url into search on the phone and this returns its tracks in the same shape
+# /search returns, so the phone can show them and rip them all in one go.
+# Public SoundCloud pages only; nothing here signs in to anything.
+_SC_LIST = re.compile(r"^https?://(www\.|m\.|on\.)?soundcloud\.com/[^\s]+$", re.I)
+
+
+def _list_sync(url: str, limit: int):
+    ydl_opts = {"quiet": True, "no_warnings": True, "extract_flat": True,
+                "skip_download": True, "playlistend": limit, "socket_timeout": 15}
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    entries = (info or {}).get("entries")
+    if entries is None and info:
+        entries = [info]                     # a single track url: a list of one
+    out = []
+    for e in (entries or []):
+        if not e:
+            continue
+        thumb = e.get("thumbnail")
+        if not thumb:
+            ts = e.get("thumbnails") or []
+            if ts:
+                thumb = ts[-1].get("url")
+        out.append({
+            "id": e.get("url") or e.get("permalink_url") or e.get("id"),
+            "title": e.get("title"),
+            "artist": e.get("uploader") or e.get("channel") or e.get("uploader_id"),
+            "duration": e.get("duration"),
+            "thumb": thumb, "views": e.get("view_count"), "src": "soundcloud",
+        })
+    return {"name": (info or {}).get("title") or "", "tracks": out}
+
+
+@app.get("/list")
+async def list_tracks(url: str = Query(...), limit: int = Query(300)):
+    url = (url or "").strip()
+    if not _SC_LIST.match(url):
+        return JSONResponse(status_code=200, content={"tracks": [], "error": "Paste a soundcloud.com link"})
+    try:
+        limit = max(1, min(int(limit), 500))
+        return await asyncio.to_thread(_list_sync, url, limit)
+    except Exception as e:
+        return JSONResponse(status_code=200, content={"tracks": [], "error": str(e)[:200]})
+
+
+# ---------------------------------------------------------------------------
 # 4. GET /stream  -- resolve best audio and proxy it to the phone
 # ---------------------------------------------------------------------------
 def _is_hls(url: str, proto: str = "") -> bool:
@@ -747,6 +797,9 @@ def _analyze(mp3_path: str):
         return {}
 
 
+_LIB_LOCK = asyncio.Lock()   # library.json writer, one at a time
+
+
 @app.post("/rip")
 async def rip(
     src: str = Query("youtube"),
@@ -808,29 +861,32 @@ async def rip(
             "source": src, "source_id": str(id), "added": int(_t.time()),
         }
 
-        # read-modify-write the library the phone reads
-        lib = {"tracks": []}
-        try:
-            obj = s3.get_object(Bucket=bucket, Key=f"u/{space}/library.json")
+        # read-modify-write the library the phone reads. ONE AT A TIME: a list
+        # rip fires several of these together, and two writers reading the
+        # same library.json would each save a copy missing the other's song.
+        async with _LIB_LOCK:
+            lib = {"tracks": []}
+            try:
+                obj = s3.get_object(Bucket=bucket, Key=f"u/{space}/library.json")
+                import json as _j
+                cur = _j.loads(obj["Body"].read().decode("utf-8"))
+                if isinstance(cur, dict) and isinstance(cur.get("tracks"), list):
+                    lib = cur
+                elif isinstance(cur, list):
+                    lib = {"tracks": cur}
+            except Exception:
+                pass
+            tracks = lib.get("tracks", [])
+            tracks = [t for t in tracks if str(t.get("raw_id")) != rid
+                      and not (t.get("source_id") and str(t.get("source_id")) == str(id)
+                               and t.get("source") == src)]
+            tracks.append(entry)   # newest at the end — matches the app's recent order
+            lib["tracks"] = tracks
             import json as _j
-            cur = _j.loads(obj["Body"].read().decode("utf-8"))
-            if isinstance(cur, dict) and isinstance(cur.get("tracks"), list):
-                lib = cur
-            elif isinstance(cur, list):
-                lib = {"tracks": cur}
-        except Exception:
-            pass
-        tracks = lib.get("tracks", [])
-        tracks = [t for t in tracks if str(t.get("raw_id")) != rid
-                  and not (t.get("source_id") and str(t.get("source_id")) == str(id)
-                           and t.get("source") == src)]
-        tracks.append(entry)   # newest at the end — matches the app's recent order
-        lib["tracks"] = tracks
-        import json as _j
-        s3.put_object(Bucket=bucket, Key=f"u/{space}/library.json",
-                      Body=_j.dumps(lib).encode("utf-8"),
-                      ContentType="application/json",
-                      CacheControl="public, max-age=60")
+            s3.put_object(Bucket=bucket, Key=f"u/{space}/library.json",
+                          Body=_j.dumps(lib).encode("utf-8"),
+                          ContentType="application/json",
+                          CacheControl="public, max-age=60")
 
         return {"ok": True, "track": entry,
                 "audio": f"{pub}/u/{space}/audio/{rid}.mp3" if pub else ""}

@@ -1237,9 +1237,13 @@ async def list_add(
     import hashlib, json as _j, re as _re, time as _t
     space = _SAFE.sub("", str(space))
     url = (url or "").strip()
-    if not space or not _re.match(r"^https?://(music\.apple\.com|geo\.music\.apple\.com)/[a-z]{2}/playlist/[^/\s]+/pl\.[0-9a-zA-Z]+", url, _re.I):
-        return JSONResponse(status_code=400, content={"ok": False, "error": "That is not an Apple Music playlist link."})
+    is_apple = bool(_re.match(r"^https?://(music\.apple\.com|geo\.music\.apple\.com)/[a-z]{2}/playlist/[^/\s]+/pl\.[0-9a-zA-Z]+", url, _re.I))
+    sp = _re.match(r"^https?://open\.spotify\.com/(?:embed/)?playlist/([A-Za-z0-9]+)", url, _re.I)
+    if not space or not (is_apple or sp):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "That is not an Apple Music or Spotify playlist link."})
     url = _re.sub(r"[?#].*$", "", url)
+    if sp:
+        url = "https://open.spotify.com/playlist/" + sp.group(1)   # the same clean form the desktop keys on
     key = "cu-" + hashlib.sha1(url.lower().encode("utf-8")).hexdigest()[:10]
     s3 = _r2()
     if s3 is None:

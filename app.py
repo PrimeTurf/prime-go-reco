@@ -291,11 +291,16 @@ async def search(
 # /search returns, so the phone can show them and rip them all in one go.
 # Public SoundCloud pages only; nothing here signs in to anything.
 _SC_LIST = re.compile(r"^https?://(www\.|m\.|on\.)?soundcloud\.com/[^\s]+$", re.I)
+# a YouTube playlist: youtube.com/playlist?list=..., or a watch link carrying list=
+_YT_LIST = re.compile(r"^https?://(www\.|m\.|music\.)?youtube\.com/(playlist\?|watch\?)[^\s]*list=[^\s&]+", re.I)
 
 
 def _list_sync(url: str, limit: int):
+    is_yt = bool(_YT_LIST.match(url))
     ydl_opts = {"quiet": True, "no_warnings": True, "extract_flat": True,
                 "skip_download": True, "playlistend": limit, "socket_timeout": 15}
+    if is_yt:
+        ydl_opts["extractor_args"] = _YT_EXTRACTOR_ARGS
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
     entries = (info or {}).get("entries")
@@ -305,6 +310,24 @@ def _list_sync(url: str, limit: int):
     sets_skipped = 0
     for e in (entries or []):
         if not e:
+            continue
+        if is_yt:
+            # a YouTube playlist entry: the 11 character id is the whole story.
+            # Ripping these is the laptop's job (YouTube blocks it here), so
+            # the phone queues them for the laptop instead of ripping.
+            the_id = e.get("id") or e.get("url")
+            title = e.get("title") or ""
+            artist = e.get("uploader") or e.get("channel") or ""
+            if not artist and " - " in title:
+                artist, title = [x.strip() for x in title.split(" - ", 1)]
+            thumb = e.get("thumbnail")
+            if not thumb:
+                ts = e.get("thumbnails") or []
+                if ts:
+                    thumb = ts[-1].get("url")
+            out.append({"id": the_id, "title": title, "artist": artist,
+                        "duration": e.get("duration"), "thumb": thumb,
+                        "views": e.get("view_count"), "src": "youtube"})
             continue
         the_id = e.get("url") or e.get("permalink_url") or e.get("id")
         # a profile page lists the DJ's own sets between the tracks. A set is
@@ -335,14 +358,15 @@ def _list_sync(url: str, limit: int):
             "duration": e.get("duration"),
             "thumb": thumb, "views": e.get("view_count"), "src": "soundcloud",
         })
-    return {"name": (info or {}).get("title") or "", "tracks": out, "sets_skipped": sets_skipped}
+    return {"name": (info or {}).get("title") or "", "tracks": out, "sets_skipped": sets_skipped,
+            "src": "youtube" if is_yt else "soundcloud"}
 
 
 @app.get("/list")
 async def list_tracks(url: str = Query(...), limit: int = Query(300)):
     url = (url or "").strip()
-    if not _SC_LIST.match(url):
-        return JSONResponse(status_code=200, content={"tracks": [], "error": "Paste a soundcloud.com link"})
+    if not (_SC_LIST.match(url) or _YT_LIST.match(url)):
+        return JSONResponse(status_code=200, content={"tracks": [], "error": "Paste a soundcloud.com link or a YouTube playlist link"})
     try:
         limit = max(1, min(int(limit), 500))
         return await asyncio.to_thread(_list_sync, url, limit)
@@ -957,11 +981,28 @@ async def queue(
     artist: str = Query(""),
     thumb: str = Query(""),
     dur: str = Query(""),
+    sc: str = Query(""),
+    why: str = Query(""),
 ):
     src = "soundcloud" if src == "soundcloud" else "youtube"
     space = _SAFE.sub("", str(space))
     if not space:
         return JSONResponse(status_code=400, content={"ok": False, "error": "no space"})
+    # THE SOUNDCLOUD ORIGINAL RIDES ALONG. A song SoundCloud refused the phone
+    # (DRM, preview) is queued for the laptop as a YouTube rip, but the laptop
+    # can also hand the SoundCloud link to MusicVerter for the real file. The
+    # search hands back api.soundcloud.com urls, which a converter site will
+    # not take, so resolve those to the public permalink here.
+    sc = (sc or "").strip()
+    if sc and "api.soundcloud.com" in sc:
+        try:
+            def _perma(u):
+                with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True}) as ydl:
+                    info = ydl.extract_info(u, download=False)
+                return (info or {}).get("webpage_url") or (info or {}).get("permalink_url") or ""
+            sc = (await asyncio.to_thread(_perma, sc)) or sc
+        except Exception:
+            pass
     s3 = _r2()
     if s3 is None:
         return JSONResponse(status_code=503, content={
@@ -994,6 +1035,7 @@ async def queue(
         "title": title or "Untitled", "artist": artist or "",
         "thumb": thumb or "", "dur": _dur, "added": int(_t.time()),
         "status": "waiting",
+        "sc": sc or "", "why": (why or "")[:120],
     })
     data["queue"] = q
     try:

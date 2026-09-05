@@ -717,8 +717,12 @@ def _rip_sync(src: str, vid: str):
             "preferredquality": "0",
         }],
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(target, download=True)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(target, download=True)
+    except Exception:
+        shutil.rmtree(workdir, ignore_errors=True)   # a refused download leaves no temp dir behind
+        raise
     if info and "entries" in info:
         ents = [e for e in (info.get("entries") or []) if e]
         if ents:
@@ -730,6 +734,27 @@ def _rip_sync(src: str, vid: str):
             mp3 = os.path.join(workdir, cand[0])
     if not os.path.exists(mp3):
         raise RuntimeError("audio did not download")
+    # A PREVIEW IS NOT THE SONG. SoundCloud hands back a 30 second snippet for
+    # a Go+ track and the download "succeeds"; the phone then had a song that
+    # cut off at half a minute and no way to know why. Measure what actually
+    # arrived against the length SoundCloud advertised: a file a fraction of
+    # the advertised length is a preview, and a preview is a refusal — the
+    # phone hands the song to the laptop, which can rip it another way.
+    try:
+        pr = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", mp3],
+            capture_output=True, text=True, timeout=30)
+        got = float((pr.stdout or "0").strip() or 0)
+        want = float((info or {}).get("duration") or 0)
+        if got and want and want > 90 and got < want * 0.6:
+            shutil.rmtree(workdir, ignore_errors=True)
+            raise RuntimeError(
+                f"Preview only — SoundCloud handed back {int(got)}s of a {int(want)}s song (Go+ track)")
+    except RuntimeError:
+        raise
+    except Exception:
+        pass
     # PEAK CAP: hot masters keep their full level (we do NOT loudness-normalize
     # rips, that would gut club weight), but a master sitting at or above full
     # scale clips on a phone speaker — the "speaker about to burst" distortion.

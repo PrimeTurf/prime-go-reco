@@ -302,22 +302,40 @@ def _list_sync(url: str, limit: int):
     if entries is None and info:
         entries = [info]                     # a single track url: a list of one
     out = []
+    sets_skipped = 0
     for e in (entries or []):
         if not e:
+            continue
+        the_id = e.get("url") or e.get("permalink_url") or e.get("id")
+        # a profile page lists the DJ's own sets between the tracks. A set is
+        # not a song: ripping it would pull a whole playlist under one name.
+        # Paste the set's own link to rip that.
+        if "/sets/" in str(the_id):
+            sets_skipped += 1
             continue
         thumb = e.get("thumbnail")
         if not thumb:
             ts = e.get("thumbnails") or []
             if ts:
                 thumb = ts[-1].get("url")
+        title = e.get("title") or ""
+        artist = e.get("uploader") or e.get("channel") or e.get("uploader_id") or ""
+        if not artist:
+            # a flat profile listing carries only url + title. The artist is
+            # in the title ("Artist - Song") or, failing that, the permalink's
+            # own user slug (soundcloud.com/<user>/<song>).
+            if " - " in title:
+                artist, title = [x.strip() for x in title.split(" - ", 1)]
+            else:
+                m = re.match(r"https?://(?:www\.|m\.)?soundcloud\.com/([^/?#]+)/", str(the_id))
+                if m:
+                    artist = m.group(1).replace("-", " ").replace("_", " ").title()
         out.append({
-            "id": e.get("url") or e.get("permalink_url") or e.get("id"),
-            "title": e.get("title"),
-            "artist": e.get("uploader") or e.get("channel") or e.get("uploader_id"),
+            "id": the_id, "title": title, "artist": artist,
             "duration": e.get("duration"),
             "thumb": thumb, "views": e.get("view_count"), "src": "soundcloud",
         })
-    return {"name": (info or {}).get("title") or "", "tracks": out}
+    return {"name": (info or {}).get("title") or "", "tracks": out, "sets_skipped": sets_skipped}
 
 
 @app.get("/list")

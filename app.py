@@ -1224,6 +1224,48 @@ async def playlist_push(
     return {"ok": True, "queued": len(want)}
 
 
+@app.post("/list_add")
+async def list_add(
+    space: str = Query(...),     # the caller's own space
+    url: str = Query(...),       # an Apple Music playlist link
+    name: str = Query(""),
+):
+    """An Apple playlist link the phone wants as one of its own lists. Queued in
+    u/<space>/inbox_lists.json; the desktop adds it to Find playlists and
+    publishes within the minute. The key is the same one the desktop will use,
+    so the phone can pin the list before it has been published."""
+    import hashlib, json as _j, re as _re, time as _t
+    space = _SAFE.sub("", str(space))
+    url = (url or "").strip()
+    if not space or not _re.match(r"^https?://(music\.apple\.com|geo\.music\.apple\.com)/[a-z]{2}/playlist/[^/\s]+/pl\.[0-9a-zA-Z]+", url, _re.I):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "That is not an Apple Music playlist link."})
+    url = _re.sub(r"[?#].*$", "", url)
+    key = "cu-" + hashlib.sha1(url.lower().encode("utf-8")).hexdigest()[:10]
+    s3 = _r2()
+    if s3 is None:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "cloud not set up"})
+    bucket = os.getenv("R2_BUCKET", "").strip()
+    if not bucket:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "R2_BUCKET not set"})
+    ik = f"u/{space}/inbox_lists.json"
+    cur = []
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=ik)
+        got = _j.loads(obj["Body"].read().decode("utf-8"))
+        cur = got.get("lists", []) if isinstance(got, dict) else (got or [])
+    except Exception:
+        cur = []
+    cur = [x for x in cur if (x or {}).get("key") != key]
+    cur.append({"key": key, "url": url, "name": (name or "").strip()[:80], "ts": int(_t.time() * 1000)})
+    cur = cur[-50:]
+    try:
+        s3.put_object(Bucket=bucket, Key=ik, Body=_j.dumps({"lists": cur}).encode("utf-8"),
+                      ContentType="application/json", CacheControl="no-cache")
+    except Exception as e:
+        return JSONResponse(status_code=200, content={"ok": False, "error": str(e)[:160]})
+    return {"ok": True, "key": key}
+
+
 # ---------------------------------------------------------------------------
 # Shazam history: one list per space, so a night's IDs are not trapped on one
 # phone. localStorage is per browser — open Prime Go from the home screen on

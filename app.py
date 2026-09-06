@@ -1370,6 +1370,78 @@ def _ai_headers(vendor: str) -> dict | None:
     return {"Authorization": f"Bearer {k}", "content-type": "application/json"} if k else None
 
 
+# WHAT THE CREW'S AI COSTS, PER SPACE. Every relayed call adds its tokens and an
+# estimated dollar figure to fam/ai_usage.json, one row per space per month, so
+# the owner's roster can show who is spending what. Estimates from list prices;
+# the vendor's bill is the truth.
+_AI_PRICES = {   # dollars per million tokens: (in, out)
+    "claude-haiku-4-5": (1.00, 5.00), "claude-3-5-haiku": (0.80, 4.00), "claude-3-haiku": (0.25, 1.25),
+    "claude-sonnet-4": (3.00, 15.00), "claude-3-5-sonnet": (3.00, 15.00),
+    "gpt-4o-mini": (0.15, 0.60), "gpt-4o": (2.50, 10.00), "gpt-4.1-mini": (0.40, 1.60), "gpt-4.1": (2.00, 8.00),
+    "gpt-5-mini": (0.25, 2.00), "gpt-5": (1.25, 10.00),
+}
+_AI_USAGE_KEY = "fam/ai_usage.json"
+_AI_USAGE_LOCK = None
+
+
+def _ai_price(model: str):
+    m = (model or "").lower()
+    for k in sorted(_AI_PRICES, key=len, reverse=True):
+        if m.startswith(k):
+            return _AI_PRICES[k]
+    return (1.00, 5.00)
+
+
+def _ai_meter(space: str, vendor: str, kind: str, model: str, tokens_in: int, tokens_out: int, usd: float) -> None:
+    """Best effort, never raises. One read-modify-write of a small file."""
+    import json as _j, time as _t, datetime as _dt
+    try:
+        s3 = _r2(); bucket = os.getenv("R2_BUCKET", "").strip()
+        if s3 is None or not bucket:
+            return
+        month = _dt.datetime.utcnow().strftime("%Y-%m")
+        cur = {}
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=_AI_USAGE_KEY)
+            cur = _j.loads(obj["Body"].read().decode("utf-8")) or {}
+        except Exception:
+            cur = {}
+        spaces = cur.setdefault("spaces", {})
+        row = spaces.setdefault(space, {})
+        if row.get("month") != month:
+            # a new month: keep last month's line, start fresh
+            row["prev"] = {"month": row.get("month"), "calls": row.get("calls", 0), "usd": row.get("usd", 0.0)} if row.get("month") else None
+            row.update({"month": month, "calls": 0, "in": 0, "out": 0, "usd": 0.0, "by_kind": {}})
+        row["calls"] = int(row.get("calls", 0)) + 1
+        row["in"] = int(row.get("in", 0)) + int(tokens_in or 0)
+        row["out"] = int(row.get("out", 0)) + int(tokens_out or 0)
+        row["usd"] = round(float(row.get("usd", 0.0)) + float(usd or 0.0), 6)
+        bk = row.setdefault("by_kind", {})
+        bk[kind] = int(bk.get(kind, 0)) + 1
+        row["last"] = int(_t.time() * 1000)
+        row["vendor_last"] = vendor
+        cur["updated"] = int(_t.time() * 1000)
+        s3.put_object(Bucket=bucket, Key=_AI_USAGE_KEY, Body=_j.dumps(cur).encode("utf-8"),
+                      ContentType="application/json", CacheControl="no-cache")
+    except Exception:
+        pass
+
+
+def _ai_cost_from(vendor: str, url: str, body: dict, content) -> tuple:
+    """(kind, model, tokens_in, tokens_out, usd) read off the vendor's answer."""
+    model = str((body or {}).get("model") or "")
+    if url.endswith("/images/generations"):
+        n = int((body or {}).get("n") or 1)
+        return ("cover art", model or "image", 0, 0, 0.04 * n)
+    usage = (content or {}).get("usage") or {} if isinstance(content, dict) else {}
+    if vendor == "anthropic":
+        ti, to = int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0)
+    else:
+        ti, to = int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)
+    pi, po = _ai_price(model)
+    return ("naming", model, ti, to, (ti * pi + to * po) / 1_000_000.0)
+
+
 @app.post("/ai/relay")
 async def ai_relay(request: Request):
     space = request.headers.get("x-prime-space", "")
@@ -1396,6 +1468,12 @@ async def ai_relay(request: Request):
         content = up.json()
     except Exception:
         content = {"error": (up.text or "")[:400]}
+    if up.status_code < 300:
+        try:
+            kind, model, ti, to, usd = _ai_cost_from(vendor, url, body, content)
+            _ai_meter(_SAFE.sub("", str(space)), vendor, kind, model, ti, to, usd)
+        except Exception:
+            pass
     return JSONResponse(status_code=up.status_code, content=content)
 
 
@@ -1426,7 +1504,105 @@ async def ai_whisper(request: Request):
                                          "response_format": str(form.get("response_format") or "text")})
     except Exception as e:
         return JSONResponse(status_code=502, content={"error": str(e)[:200]})
+    if up.status_code < 300:
+        # Whisper bills by the minute; the clip is about a minute
+        _ai_meter(_SAFE.sub("", str(space)), "openai", "listening", "whisper-1", 0, 0, 0.006)
     return PlainTextResponse(up.text or "", status_code=up.status_code)
+
+
+# ---------------------------------------------------------------------------
+# The crew: every space in the bucket with its DJ name and size, for a phone
+# that wants to browse the homies' libraries. Cached ten minutes.
+# ---------------------------------------------------------------------------
+_CREW_CACHE = {"at": 0.0, "rows": []}
+
+
+@app.get("/crew")
+async def crew(space: str = Query("")):
+    import json as _j, time as _t
+    me = _SAFE.sub("", str(space or ""))
+    if not _space_known(me):
+        return JSONResponse(status_code=403, content={"ok": False, "error": "unknown space"})
+    if _t.time() - _CREW_CACHE["at"] > 600 or not _CREW_CACHE["rows"]:
+        rows = []
+        try:
+            s3 = _r2(); bucket = os.getenv("R2_BUCKET", "").strip()
+            pref = s3.list_objects_v2(Bucket=bucket, Prefix="u/", Delimiter="/")
+            spaces = [p["Prefix"].split("/")[1] for p in pref.get("CommonPrefixes", [])][:60]
+            for sp in spaces:
+                dj, count, pls = "", None, 0
+                try:
+                    m = s3.get_object(Bucket=bucket, Key=f"u/{sp}/meta.json")
+                    dj = (_j.loads(m["Body"].read().decode("utf-8")) or {}).get("dj") or ""
+                except Exception:
+                    pass
+                try:
+                    lib = s3.get_object(Bucket=bucket, Key=f"u/{sp}/library.json")
+                    got = _j.loads(lib["Body"].read().decode("utf-8"))
+                    arr = got.get("tracks", []) if isinstance(got, dict) else (got or [])
+                    count = len(arr)
+                except Exception:
+                    continue                      # no library: not a crew space
+                try:
+                    pl = s3.get_object(Bucket=bucket, Key=f"u/{sp}/playlists.json")
+                    pg = _j.loads(pl["Body"].read().decode("utf-8"))
+                    pls = len(pg.get("playlists", []) if isinstance(pg, dict) else (pg or []))
+                except Exception:
+                    pls = 0
+                if count:
+                    rows.append({"space": sp, "dj": dj, "count": count, "playlists": pls})
+        except Exception:
+            rows = _CREW_CACHE["rows"]
+        _CREW_CACHE.update({"at": _t.time(), "rows": rows})
+    out = [r for r in _CREW_CACHE["rows"] if r["space"] != me]
+    out.sort(key=lambda r: -(r.get("count") or 0))
+    return {"ok": True, "crew": out}
+
+
+# ---------------------------------------------------------------------------
+# Lyrics: LRCLIB (open, free) behind the service, so the phone never depends on
+# a third party's CORS headers. Timed words when it has them, plain otherwise.
+# ---------------------------------------------------------------------------
+_LY_CACHE: dict = {}
+
+
+@app.get("/lyrics")
+async def lyrics(artist: str = Query(""), title: str = Query(""), duration: int = Query(0)):
+    import time as _t
+    artist = (artist or "").strip()[:200]; title = (title or "").strip()[:200]
+    if not title:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "no title"})
+    key = f"{artist.lower()}|{title.lower()}|{int(duration or 0)}"
+    hit = _LY_CACHE.get(key)
+    if hit and _t.time() - hit[1] < 86400:
+        return hit[0]
+    out = {"ok": True, "synced": "", "plain": ""}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(12.0), headers={"Lrclib-Client": "PrimeRip/2.0"}) as client:
+            params = {"artist_name": artist, "track_name": title}
+            if duration:
+                params["duration"] = int(duration)
+            r = await client.get("https://lrclib.net/api/get", params=params)
+            j = r.json() if r.status_code == 200 else None
+            if not j:
+                # loose search when the exact pair misses (a remix tag, a feat.)
+                r2 = await client.get("https://lrclib.net/api/search", params={"track_name": title, "artist_name": artist} if artist else {"q": title})
+                arr = r2.json() if r2.status_code == 200 else []
+                if isinstance(arr, list) and arr:
+                    # prefer a timed result close to the length we know
+                    def score(x):
+                        d = abs(int(x.get("duration") or 0) - int(duration or 0)) if duration else 0
+                        return (0 if x.get("syncedLyrics") else 1, d)
+                    j = sorted(arr, key=score)[0]
+            if isinstance(j, dict):
+                out["synced"] = j.get("syncedLyrics") or ""
+                out["plain"] = j.get("plainLyrics") or ""
+    except Exception as e:
+        out = {"ok": True, "synced": "", "plain": "", "note": str(e)[:100]}
+    if len(_LY_CACHE) > 5000:
+        _LY_CACHE.clear()
+    _LY_CACHE[key] = (out, _t.time())
+    return out
 
 
 @app.post("/share_log")
@@ -1580,6 +1756,144 @@ async def sync_ping(space: str = Query(...)):
     except Exception as e:
         return JSONResponse(status_code=200, content={"ok": False, "error": str(e)[:160]})
     return {"ok": True, "at": at}
+
+
+# ==================== SONG REQUESTS FROM THE FLOOR ====================
+# The Decks page shows a QR. A guest scans it, lands on /req/<space>, types a
+# song and a name, and the note goes to u/<space>/inbox_requests.json. That
+# space's desktop drains the inbox every few seconds while the Decks page is
+# open and the request pops up on the decks with the matching song found.
+_REQ_DJ_CACHE: dict = {}
+_REQ_RATE: dict = {}
+
+
+def _req_dj(space: str) -> str:
+    import json as _j, time as _t
+    hit = _REQ_DJ_CACHE.get(space)
+    if hit and _t.time() - hit[0] < 600:
+        return hit[1]
+    dj = ""
+    try:
+        s3 = _r2(); bucket = os.getenv("R2_BUCKET", "").strip()
+        m = s3.get_object(Bucket=bucket, Key=f"u/{space}/meta.json")
+        dj = ((_j.loads(m["Body"].read().decode("utf-8")) or {}).get("dj") or "").strip()[:60]
+    except Exception:
+        dj = ""
+    _REQ_DJ_CACHE[space] = (_t.time(), dj)
+    return dj
+
+
+_REQ_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Request a song</title>
+<style>
+  :root{color-scheme:dark}
+  body{margin:0;background:#0b0d12;color:#e8edf4;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center}
+  .card{width:min(440px,92vw);padding:28px 22px 26px;background:#141821;border:1px solid #262c38;border-radius:18px;box-shadow:0 20px 60px rgba(0,0,0,.6)}
+  .brand{font-size:11px;letter-spacing:.26em;text-transform:uppercase;color:#4de1ff;font-weight:800}
+  h1{font-size:24px;margin:10px 0 4px;line-height:1.2}
+  .dj{color:#8fa0b5;font-size:14px;margin:0 0 18px}
+  label{display:block;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#8fa0b5;font-weight:800;margin:14px 0 6px}
+  input{width:100%;box-sizing:border-box;background:#0b0d12;border:1px solid #2a2f3a;border-radius:12px;color:#fff;font-size:17px;padding:14px 14px;outline:none}
+  input:focus{border-color:#4de1ff}
+  button{width:100%;margin-top:18px;background:#4de1ff;color:#0b0d12;border:0;border-radius:12px;font-size:16px;font-weight:900;letter-spacing:.04em;padding:15px 0;cursor:pointer}
+  button:disabled{opacity:.55}
+  .done{display:none;text-align:center;padding:14px 0 4px}
+  .done b{display:block;font-size:22px;margin-bottom:6px}
+  .note{font-size:12.5px;color:#8fa0b5;margin-top:14px;text-align:center}
+  .again{background:transparent;color:#4de1ff;border:1px solid #2a2f3a;margin-top:12px}
+  .err{color:#ff8f86;font-size:13px;margin-top:10px;min-height:16px;text-align:center}
+</style></head><body>
+<div class="card">
+  <div class="brand">Prime Rip · Requests</div>
+  <h1>Request a song</h1>
+  <p class="dj">__DJ__</p>
+  <form id="f">
+    <label for="song">Song and artist</label>
+    <input id="song" name="song" maxlength="120" placeholder="Song — Artist" autocomplete="off" autofocus required>
+    <label for="name">Your name <span style="opacity:.6;letter-spacing:0;text-transform:none;font-weight:600">(optional)</span></label>
+    <input id="name" name="name" maxlength="40" placeholder="So the DJ knows who asked" autocomplete="off">
+    <button id="go" type="submit">Send it to the booth</button>
+    <div class="err" id="err"></div>
+  </form>
+  <div class="done" id="done">
+    <b>Sent to the booth. 🎧</b>
+    <span id="echo"></span>
+    <button class="again" id="again" type="button">Request another</button>
+  </div>
+  <p class="note">Party on.</p>
+</div>
+<script>
+  const f=document.getElementById('f'),go=document.getElementById('go'),err=document.getElementById('err');
+  try{document.getElementById('name').value=localStorage.getItem('pr_req_name')||''}catch(e){}
+  f.onsubmit=async(e)=>{e.preventDefault();const song=document.getElementById('song').value.trim();const name=document.getElementById('name').value.trim();
+    if(!song)return;go.disabled=true;go.textContent='Sending…';err.textContent='';
+    try{localStorage.setItem('pr_req_name',name)}catch(e){}
+    let ok=false,msg='';
+    for(let i=0;i<12&&!ok;i++){try{const r=await fetch('/request?space=__SPACE__',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({song,name})});
+      const j=await r.json().catch(()=>({}));ok=!!(r.ok&&j.ok);msg=j.error||'';if(!ok&&(r.status===429||r.status===400||r.status===403))break;}
+      catch(x){msg='no signal';go.textContent=i<2?'Sending…':'Waking up the booth…';await new Promise(r=>setTimeout(r,3000));}}
+    if(ok){f.style.display='none';document.getElementById('done').style.display='block';document.getElementById('echo').textContent='“'+song+'”'+(name?' — '+name:'');}
+    else{err.textContent=msg==='slow down'?'Easy — a few requests a minute is plenty.':'Could not reach the booth. Try again in a second.';go.disabled=false;go.textContent='Send it to the booth';}
+  };
+  document.getElementById('again').onclick=()=>{document.getElementById('done').style.display='none';f.style.display='block';document.getElementById('song').value='';document.getElementById('song').focus();};
+</script></body></html>"""
+
+
+@app.get("/req/{space}")
+async def request_page(space: str):
+    from fastapi.responses import HTMLResponse
+    space = _SAFE.sub("", str(space or ""))
+    if not space or not _space_known(space):
+        return HTMLResponse("<h1 style='font-family:sans-serif'>That request line is not live.</h1>", status_code=404)
+    dj = _req_dj(space)
+    line = (f"{dj} is on the decks. What do you want to hear?" if dj else "The DJ is on the decks. What do you want to hear?")
+    html = _REQ_PAGE.replace("__DJ__", line.replace("<", "&lt;")).replace("__SPACE__", space)
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/request")
+async def request_post(request: Request, space: str = Query(...)):
+    import json as _j, time as _t
+    space = _SAFE.sub("", str(space or ""))
+    if not space or not _space_known(space):
+        return JSONResponse(status_code=403, content={"ok": False, "error": "unknown space"})
+    # a phone gets five a minute; the floor does not need more than that
+    ip = (request.client.host if request.client else "") or "?"
+    now = _t.time()
+    hits = [t for t in _REQ_RATE.get(ip, []) if now - t < 60]
+    if len(hits) >= 5:
+        return JSONResponse(status_code=429, content={"ok": False, "error": "slow down"})
+    hits.append(now); _REQ_RATE[ip] = hits
+    if len(_REQ_RATE) > 5000:
+        _REQ_RATE.clear()
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    song = " ".join(str(body.get("song") or "").split())[:120]
+    name = " ".join(str(body.get("name") or "").split())[:40]
+    if len(song) < 2:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "empty"})
+    s3 = _r2(); bucket = os.getenv("R2_BUCKET", "").strip()
+    if s3 is None or not bucket:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "cloud not set up"})
+    ik = f"u/{space}/inbox_requests.json"
+    cur = []
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=ik)
+        got = _j.loads(obj["Body"].read().decode("utf-8"))
+        cur = got.get("requests", []) if isinstance(got, dict) else (got or [])
+    except Exception:
+        cur = []
+    cur.append({"song": song, "name": name, "ts": int(now * 1000)})
+    cur = cur[-200:]
+    try:
+        s3.put_object(Bucket=bucket, Key=ik, Body=_j.dumps({"requests": cur}).encode("utf-8"),
+                      ContentType="application/json", CacheControl="no-cache")
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)[:80]})
+    return {"ok": True}
 
 
 if __name__ == "__main__":

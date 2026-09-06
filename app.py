@@ -1325,6 +1325,110 @@ async def list_add(
     return {"ok": True, "key": key}
 
 
+# ---------------------------------------------------------------------------
+# THE CREW'S AI KEY. Friends' copies have no key of their own; the owner's keys
+# live here as ANTHROPIC_API_KEY / OPENAI_API_KEY. A Prime Rip install with a
+# claimed cloud space sends its AI call here, the key is added, the upstream
+# answer goes back untouched (status and body), so the app reads it exactly as
+# a direct call. Only known upstreams, only known spaces. No daily cap, by the
+# owner's choice; the space check keeps strangers off the key.
+# ---------------------------------------------------------------------------
+_AI_UPSTREAMS = {
+    "https://api.anthropic.com/v1/messages": "anthropic",
+    "https://api.openai.com/v1/chat/completions": "openai",
+    "https://api.openai.com/v1/images/generations": "openai",
+}
+_SPACE_OK: dict = {}
+
+
+def _space_known(space: str) -> bool:
+    """A space is real when its manifest sits in the bucket. Remembered ten minutes."""
+    import time as _t
+    space = _SAFE.sub("", str(space or ""))
+    if not space:
+        return False
+    hit = _SPACE_OK.get(space)
+    if hit and _t.time() - hit[1] < 600:
+        return hit[0]
+    ok = False
+    try:
+        s3 = _r2(); bucket = os.getenv("R2_BUCKET", "").strip()
+        if s3 is not None and bucket:
+            s3.head_object(Bucket=bucket, Key=f"u/{space}/manifest.json")
+            ok = True
+    except Exception:
+        ok = False
+    _SPACE_OK[space] = (ok, _t.time())
+    return ok
+
+
+def _ai_headers(vendor: str) -> dict | None:
+    if vendor == "anthropic":
+        k = os.getenv("ANTHROPIC_API_KEY", "").strip()
+        return {"x-api-key": k, "anthropic-version": "2023-06-01", "content-type": "application/json"} if k else None
+    k = os.getenv("OPENAI_API_KEY", "").strip()
+    return {"Authorization": f"Bearer {k}", "content-type": "application/json"} if k else None
+
+
+@app.post("/ai/relay")
+async def ai_relay(request: Request):
+    space = request.headers.get("x-prime-space", "")
+    if not _space_known(space):
+        return JSONResponse(status_code=403, content={"error": "unknown space"})
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "bad json"})
+    url = str((payload or {}).get("url") or "")
+    body = (payload or {}).get("body")
+    vendor = _AI_UPSTREAMS.get(url)
+    if not vendor or not isinstance(body, dict):
+        return JSONResponse(status_code=400, content={"error": "not an allowed AI call"})
+    headers = _ai_headers(vendor)
+    if headers is None:
+        return JSONResponse(status_code=503, content={"error": f"the crew has no {vendor} key set"})
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(90.0)) as client:
+            up = await client.post(url, headers=headers, json=body)
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": str(e)[:200]})
+    try:
+        content = up.json()
+    except Exception:
+        content = {"error": (up.text or "")[:400]}
+    return JSONResponse(status_code=up.status_code, content=content)
+
+
+@app.post("/ai/whisper")
+async def ai_whisper(request: Request):
+    """The lyric ear: the clip rides here as multipart and goes to Whisper with
+    the crew's OpenAI key. Answers plain text like Whisper does."""
+    from fastapi.responses import PlainTextResponse
+    space = request.headers.get("x-prime-space", "")
+    if not _space_known(space):
+        return JSONResponse(status_code=403, content={"error": "unknown space"})
+    k = os.getenv("OPENAI_API_KEY", "").strip()
+    if not k:
+        return JSONResponse(status_code=503, content={"error": "the crew has no openai key set"})
+    try:
+        form = await request.form()
+        f = form.get("file")
+        if f is None:
+            return JSONResponse(status_code=400, content={"error": "no file"})
+        data = await f.read()
+        if len(data) > 25 * 1024 * 1024:
+            return JSONResponse(status_code=413, content={"error": "clip too big"})
+        async with httpx.AsyncClient(timeout=httpx.Timeout(150.0)) as client:
+            up = await client.post("https://api.openai.com/v1/audio/transcriptions",
+                                   headers={"Authorization": f"Bearer {k}"},
+                                   files={"file": (getattr(f, "filename", "clip.mp3") or "clip.mp3", data, "audio/mpeg")},
+                                   data={"model": str(form.get("model") or "whisper-1"),
+                                         "response_format": str(form.get("response_format") or "text")})
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": str(e)[:200]})
+    return PlainTextResponse(up.text or "", status_code=up.status_code)
+
+
 @app.post("/share_log")
 async def share_log(
     space: str = Query(...),     # the sender's space

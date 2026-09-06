@@ -1325,6 +1325,43 @@ async def list_add(
     return {"ok": True, "key": key}
 
 
+@app.post("/share_log")
+async def share_log(
+    space: str = Query(...),     # the sender's space
+    to: str = Query(...),        # who they sent Prime Rip to
+    dj: str = Query(""),         # the sender's DJ name
+):
+    """WHO SHARED PRIME RIP, AND TO WHOM. A phone that sends the download email
+    leaves a note in u/<space>/inbox_shares.json; that space's desktop logs it
+    to the network on its next tick and clears the inbox, so the owner sees
+    every share under Network → Shares."""
+    import json as _j, re as _re, time as _t
+    space = _SAFE.sub("", str(space))
+    to = (to or "").strip().lower()[:120]
+    if not space or not _re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", to):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "bad request"})
+    s3 = _r2()
+    bucket = os.getenv("R2_BUCKET", "").strip()
+    if s3 is None or not bucket:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "cloud not set up"})
+    ik = f"u/{space}/inbox_shares.json"
+    cur = []
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=ik)
+        got = _j.loads(obj["Body"].read().decode("utf-8"))
+        cur = got.get("shares", []) if isinstance(got, dict) else (got or [])
+    except Exception:
+        cur = []
+    cur.append({"to": to, "dj": (dj or "").strip()[:60], "via": "prime go", "ts": int(_t.time() * 1000)})
+    cur = cur[-200:]
+    try:
+        s3.put_object(Bucket=bucket, Key=ik, Body=_j.dumps({"shares": cur}).encode("utf-8"),
+                      ContentType="application/json", CacheControl="no-cache")
+    except Exception as e:
+        return JSONResponse(status_code=200, content={"ok": False, "error": str(e)[:160]})
+    return {"ok": True}
+
+
 # ---------------------------------------------------------------------------
 # Shazam history: one list per space, so a night's IDs are not trapped on one
 # phone. localStorage is per browser — open Prime Go from the home screen on

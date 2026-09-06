@@ -1224,6 +1224,61 @@ async def playlist_push(
     return {"ok": True, "queued": len(want)}
 
 
+# ---------------------------------------------------------------------------
+# Now on SiriusXM: the last few plays on a channel, from xmplaylist, which logs
+# every channel's airplay and publishes it free. Proxied here so the phone
+# needs no cross origin permission and the service's one required header (a
+# user agent) is set once. Cached a minute per channel; the feed itself
+# updates about every two.
+# ---------------------------------------------------------------------------
+_XM_UA = "PrimeRip/1.0 (DJ crate tool; contact office@primecarega.org)"
+_XM_CACHE: dict = {}
+
+
+@app.get("/xm_now")
+async def xm_now(channel: str = Query(...), limit: int = Query(12)):
+    import re as _re, time as _t
+    ch = _re.sub(r"[^a-z0-9]", "", (channel or "").lower())[:40]
+    if not ch:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "channel?"})
+    limit = max(1, min(int(limit), 40))
+    now = _t.time()
+    hit = _XM_CACHE.get(ch)
+    if hit and now - hit[0] < 60:
+        return {"ok": True, "channel": ch, "plays": hit[1][:limit], "cached": True}
+    try:
+        async with httpx.AsyncClient(timeout=12, headers={"User-Agent": _XM_UA, "Accept": "application/json"}) as c:
+            r = await c.get(f"https://xmplaylist.com/api/station/{ch}")
+            r.raise_for_status()
+            data = r.json()
+    except Exception as e:
+        if hit:
+            return {"ok": True, "channel": ch, "plays": hit[1][:limit], "stale": True}
+        return JSONResponse(status_code=200, content={"ok": False, "error": f"xmplaylist did not answer: {str(e)[:100]}"})
+    rows = data.get("results") if isinstance(data, dict) else data
+    plays = []
+    for row in (rows or [])[:40]:
+        tr = row.get("track") or {}
+        title = str(tr.get("title") or "").strip()
+        if not title:
+            continue
+        arts = tr.get("artists") or []
+        sp = row.get("spotify") or {}
+        sc = yt = ""
+        for ln in row.get("links") or []:
+            site, url = str(ln.get("site") or ""), str(ln.get("url") or "")
+            if site == "soundcloud" and url:
+                sc = url
+            elif site == "youtube" and url:
+                m = _re.search(r"[?&]v=([A-Za-z0-9_-]{6,})", url)
+                yt = m.group(1) if m else ""
+        plays.append({"artist": ", ".join(str(a) for a in arts if a) if isinstance(arts, list) else str(arts or ""),
+                      "title": title, "art": sp.get("albumImageMedium") or sp.get("albumImageLarge") or "",
+                      "ts": row.get("timestamp") or "", "sc": sc, "yt": yt})
+    _XM_CACHE[ch] = (now, plays)
+    return {"ok": True, "channel": ch, "plays": plays[:limit]}
+
+
 @app.post("/list_add")
 async def list_add(
     space: str = Query(...),     # the caller's own space

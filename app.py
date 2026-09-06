@@ -1896,6 +1896,30 @@ async def request_post(request: Request, space: str = Query(...)):
     return {"ok": True}
 
 
+# ==================== INSTALL REPORTS ====================
+# When INSTALL ME cannot bring the engine up on a friend's machine, it posts
+# its log here on its own. The owner's desktop reads fam/install_reports/
+# and lists them under Network, so nobody has to screenshot anything.
+@app.post("/install_report")
+async def install_report(request: Request, host: str = Query(""), os_: str = Query("", alias="os")):
+    import time as _t
+    body = await request.body()
+    text = body[:65536].decode("utf-8", "ignore")
+    if not text.strip():
+        return JSONResponse(status_code=400, content={"ok": False})
+    s3 = _r2(); bucket = os.getenv("R2_BUCKET", "").strip()
+    if s3 is None or not bucket:
+        return JSONResponse(status_code=503, content={"ok": False})
+    host = _SAFE.sub("", str(host or ""))[:40] or "unknown"
+    os_ = _SAFE.sub("", str(os_ or ""))[:10] or "os"
+    key = f"fam/install_reports/{int(_t.time())}_{os_}_{host}.txt"
+    try:
+        s3.put_object(Bucket=bucket, Key=key, Body=text.encode("utf-8"), ContentType="text/plain; charset=utf-8")
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)[:80]})
+    return {"ok": True}
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "8000"))

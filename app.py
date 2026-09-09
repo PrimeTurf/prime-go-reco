@@ -1726,6 +1726,102 @@ async def shazam_list(space: str = Query(...)):
 
 
 # ---------------------------------------------------------------------------
+# ONE PLAY HISTORY FOR BOTH PLAYERS.
+#
+# John: "lets have whatever songs i play on prgo and prime rip be the same
+# recent played etc." Before this the phone kept its plays on the phone and the
+# desktop kept its plays in the desktop database, so Recently played said two
+# different things depending on which screen you were looking at.
+#
+# The bucket is the only thing both of them can reach, so the log lives there:
+# u/<space>/plays.json, newest last, capped. Both ends append to it and both
+# ends read it. A play is (raw_id, second) — the same song played twice in the
+# same second is one play, so a retry after a dropped connection costs nothing.
+# ---------------------------------------------------------------------------
+_PLAY_KEY = "plays.json"
+_PLAY_MAX = 600
+
+
+def _plays_read(s3, bucket: str, space: str) -> list:
+    import json as _j
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=f"u/{space}/{_PLAY_KEY}")
+        got = _j.loads(obj["Body"].read().decode("utf-8"))
+        items = got.get("plays", []) if isinstance(got, dict) else (got or [])
+        return [x for x in items if isinstance(x, dict) and x.get("id") is not None] if isinstance(items, list) else []
+    except Exception:
+        return []
+
+
+@app.post("/play_log")
+async def play_log(
+    space: str = Query(...),
+    ids: str = Query(...),
+    src: str = Query(""),
+    ts: int = Query(0),
+):
+    """Record one or more plays against this space. ids is a comma separated
+    list of raw_ids, so the desktop can send a whole set in one call instead of
+    one request a song."""
+    space = _SAFE.sub("", str(space))
+    if not space:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "bad request"})
+    s3 = _r2()
+    bucket = os.getenv("R2_BUCKET", "").strip()
+    if s3 is None or not bucket:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "cloud not set up"})
+    import json as _j, time as _t
+    now = int(ts) if ts else int(_t.time() * 1000)
+    src = (src or "").strip()[:12] or "?"
+    want = []
+    for part in str(ids or "").split(","):
+        part = part.strip()
+        if part.isdigit():
+            want.append(int(part))
+    if not want:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "no ids"})
+    cur = _plays_read(s3, bucket, space)
+    seen = {(int(c.get("id") or 0), int((c.get("ts") or 0) // 1000)) for c in cur}
+    added = 0
+    for rid in want[-100:]:
+        sig = (rid, now // 1000)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        cur.append({"id": rid, "ts": now, "src": src})
+        added += 1
+    cur.sort(key=lambda c: c.get("ts") or 0)
+    cur = cur[-_PLAY_MAX:]
+    try:
+        s3.put_object(Bucket=bucket, Key=f"u/{space}/{_PLAY_KEY}",
+                      Body=_j.dumps({"plays": cur}).encode("utf-8"),
+                      ContentType="application/json", CacheControl="no-cache")
+    except Exception as e:
+        return JSONResponse(status_code=200, content={"ok": False, "error": str(e)[:160]})
+    return {"ok": True, "added": added, "count": len(cur)}
+
+
+@app.get("/plays")
+async def plays(space: str = Query(...), limit: int = Query(200)):
+    """The shared play history, NEWEST FIRST. The phone and the desktop both
+    read this so Recently played says the same thing on both."""
+    space = _SAFE.sub("", str(space))
+    if not space:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "bad request"})
+    s3 = _r2()
+    bucket = os.getenv("R2_BUCKET", "").strip()
+    if s3 is None or not bucket:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "cloud not set up"})
+    got = _plays_read(s3, bucket, space)
+    got.sort(key=lambda c: c.get("ts") or 0, reverse=True)
+    try:
+        n = max(1, min(600, int(limit)))
+    except Exception:
+        n = 200
+    return {"ok": True, "plays": got[:n]}
+
+
+# ---------------------------------------------------------------------------
 # Sync now: the phone asks the laptop to go, instead of waiting for its timer.
 #
 # The phone cannot reach the laptop. It has no address for it and the laptop is

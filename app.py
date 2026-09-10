@@ -1726,6 +1726,138 @@ async def shazam_list(space: str = Query(...)):
 
 
 # ---------------------------------------------------------------------------
+# START A WAITING LIST FROM THE PHONE.
+#
+# John: "on prgo I want to go to settings where it shows what's currently
+# ripping and then be able to also select the pending playlist to rip."
+#
+# The desktop publishes what is still queued (u/<space>/pending.json) and reads
+# this inbox every twenty seconds. A tap leaves one ask here naming which of
+# that desktop's OWN groups to start — source, playlist, owner, nothing else.
+# It cannot name a file, a path or a command; the desktop looks the group up in
+# its own database and runs the same Resume it runs for itself.
+# ---------------------------------------------------------------------------
+_RESUME_KEY = "resume_inbox.json"
+_RESUME_MAX = 20
+
+
+@app.post("/resume_ask")
+async def resume_ask(space: str = Query(...), source: str = Query(""),
+                     playlist: str = Query(""), owner: str = Query("")):
+    space = _SAFE.sub("", str(space))
+    if not space:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "bad request"})
+    source = (source or "").strip()[:60]
+    playlist = (playlist or "").strip()[:200]
+    owner = (owner or "").strip()[:120]
+    if not (source or playlist):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "name a list"})
+    s3 = _r2()
+    bucket = os.getenv("R2_BUCKET", "").strip()
+    if s3 is None or not bucket:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "cloud not set up"})
+    import json as _j, time as _t
+    key = f"u/{space}/{_RESUME_KEY}"
+    asks = []
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        got = _j.loads(obj["Body"].read().decode("utf-8"))
+        cur = got.get("asks") if isinstance(got, dict) else got
+        if isinstance(cur, list):
+            asks = [a for a in cur if isinstance(a, dict)]
+    except Exception:
+        asks = []
+    sig = (source, playlist, owner)
+    # asking twice for the same list is one ask, so a double tap costs nothing
+    if not any((a.get("source"), a.get("playlist"), a.get("owner")) == sig for a in asks):
+        asks.append({"source": source, "playlist": playlist, "owner": owner,
+                     "at": int(_t.time())})
+    asks = asks[-_RESUME_MAX:]
+    try:
+        s3.put_object(Bucket=bucket, Key=key, Body=_j.dumps({"asks": asks}).encode("utf-8"),
+                      ContentType="application/json", CacheControl="no-cache")
+    except Exception as e:
+        return JSONResponse(status_code=200, content={"ok": False, "error": str(e)[:160]})
+    return {"ok": True, "waiting": len(asks)}
+
+
+# ---------------------------------------------------------------------------
+# THE LISTS YOU KEEP, WHEREVER YOU ARE.
+#
+# John: "for the desktop library lets also wire in the made for you playlist and
+# the playlist that we also save."
+#
+# Adding a list to your home screen on Prime Go wrote the key into the PHONE'S
+# localStorage and nowhere else, so the desktop had no idea those lists existed.
+# The bucket is the only thing both ends can reach, so the pins live there:
+# u/<space>/pins.json. The phone still keeps its local copy and works offline;
+# this is the shared truth both it and Prime Rip read.
+# ---------------------------------------------------------------------------
+_PINS_KEY = "pins.json"
+_PINS_MAX = 200
+
+
+def _pins_read(s3, bucket: str, space: str) -> list:
+    import json as _j
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=f"u/{space}/{_PINS_KEY}")
+        got = _j.loads(obj["Body"].read().decode("utf-8"))
+        keys = got.get("keys", []) if isinstance(got, dict) else (got or [])
+        if not isinstance(keys, list):
+            return []
+        out, seen = [], set()
+        for k in keys:
+            k = str(k or "").strip()[:120]
+            if k and k not in seen:
+                seen.add(k); out.append(k)
+        return out[:_PINS_MAX]
+    except Exception:
+        return []
+
+
+@app.post("/pins_push")
+async def pins_push(space: str = Query(...), keys: str = Query("")):
+    """Replace this space's pinned lists. The phone sends the whole set after
+    every change, so an add and a remove are the same call and a lost request
+    is fixed by the next one."""
+    space = _SAFE.sub("", str(space))
+    if not space:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "bad request"})
+    s3 = _r2()
+    bucket = os.getenv("R2_BUCKET", "").strip()
+    if s3 is None or not bucket:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "cloud not set up"})
+    import json as _j, time as _t
+    want, seen = [], set()
+    for k in str(keys or "").split(","):
+        k = k.strip()[:120]
+        if k and k not in seen:
+            seen.add(k); want.append(k)
+    want = want[:_PINS_MAX]
+    try:
+        s3.put_object(Bucket=bucket, Key=f"u/{space}/{_PINS_KEY}",
+                      Body=_j.dumps({"keys": want, "at": int(_t.time())}).encode("utf-8"),
+                      ContentType="application/json", CacheControl="no-cache")
+    except Exception as e:
+        return JSONResponse(status_code=200, content={"ok": False, "error": str(e)[:160]})
+    return {"ok": True, "count": len(want)}
+
+
+@app.get("/pins")
+async def pins_get(space: str = Query(...)):
+    """This space's pinned lists. The phone and the desktop both read the public
+    object directly when they can; this is the fallback."""
+    space = _SAFE.sub("", str(space))
+    if not space:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "bad request"})
+    s3 = _r2()
+    bucket = os.getenv("R2_BUCKET", "").strip()
+    if s3 is None or not bucket:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "cloud not set up"})
+    return {"ok": True, "keys": _pins_read(s3, bucket, space)}
+
+
+# ---------------------------------------------------------------------------
 # ONE PLAY HISTORY FOR BOTH PLAYERS.
 #
 # John: "lets have whatever songs i play on prgo and prime rip be the same
